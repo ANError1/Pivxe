@@ -1,0 +1,20 @@
+name = "pixiv-api-mirror"
+main = "src/index.js"
+compatibility_date = "2025-02-01"
+
+[vars]
+CACHE_TTL = "60"
+ALLOWED_ORIGINS = "*"
+ENABLE_IMAGE_PROXY = "true"
+
+# 可选：Cloudflare Workers 原生限流绑定；启用后按客户端 IP 限流。
+# namespace_id 请为本账号中此用途选择独立的正整数。
+# [[ratelimits]]
+# name = "RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 60, period = 60 }
+
+# 自定义域名（启用前替换为你拥有的域名）：
+# [[routes]]
+# pattern = "pixiv-api.example.com"
+# custom_domain = true
