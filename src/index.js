@@ -39,7 +39,7 @@ async function handle(request, env, ctx) {
     });
   }
   // CORS 不是身份认证；为共享的 Pixiv 账号配置独立入口密钥。
-  if (env.API_KEY && request.headers.get("Authorization") !== `Bearer ${env.API_KEY}`) {
+  if (env.API_KEY && !secureCompare(request.headers.get("Authorization"), `Bearer ${env.API_KEY}`)) {
     throw problem(401, "Unauthorized");
   }
   if (env.RATE_LIMITER) {
@@ -182,6 +182,11 @@ async function proxyImage(url, env, ctx) {
       !["i.pximg.net", "s.pximg.net"].includes(target.hostname)) {
     throw problem(403, "Only approved Pixiv image hosts are allowed");
   }
+  // 防止路径穿越和 URL 编码绕过
+  const path = target.pathname;
+  if (path.includes("..") || path.includes("%2e%2e") || path.includes("%252e")) {
+    throw problem(403, "Path traversal attempt detected");
+  }
   // 禁止 URL 凭据和任意查询串；图片仅按 CDN 路径寻址。
   target.search = "";
   target.hash = "";
@@ -207,11 +212,22 @@ async function proxyImage(url, env, ctx) {
   } else if (length > MAX_IMAGE_BYTES) {
     await response.body?.cancel();
     throw problem(413, "Image exceeds 25 MiB limit");
+  } else if (length === 0) {
+    await response.body?.cancel();
+    throw problem(502, "Empty image response");
   }
   let streamedSize = 0;
+  let lastChunkTime = Date.now();
+  const CHUNK_TIMEOUT = 10_000; // 10秒无数据则超时
   const body = response.body
     ? response.body.pipeThrough(new TransformStream({
         transform(chunk, controller) {
+          const now = Date.now();
+          if (now - lastChunkTime > CHUNK_TIMEOUT) {
+            controller.error(new Error("chunk timeout"));
+            return;
+          }
+          lastChunkTime = now;
           streamedSize += chunk.byteLength;
           if (streamedSize > MAX_IMAGE_BYTES) {
             controller.error(new Error("image exceeds limit"));
@@ -262,4 +278,17 @@ function upstreamProblem(status) {
   if (status === 404) return problem(404, "Not Found");
   if (status === 429) return problem(429, "Pixiv upstream rate limit reached");
   return problem(502, "Pixiv upstream request failed");
+}
+function secureCompare(a, b) {
+  // 恒定时间字符串比较，防止时序攻击
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) {
+    // 长度不同时仍进行完整比较以保持恒定时间
+    b = a;
+  }
+  let result = a.length ^ b.length;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
 }
