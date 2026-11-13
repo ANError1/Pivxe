@@ -182,9 +182,18 @@ async function proxyImage(url, env, ctx) {
       !["i.pximg.net", "s.pximg.net"].includes(target.hostname)) {
     throw problem(403, "Only approved Pixiv image hosts are allowed");
   }
-  // 防止路径穿越和 URL 编码绕过
-  const path = target.pathname;
-  if (path.includes("..") || path.includes("%2e%2e") || path.includes("%252e")) {
+  // 防止 Unicode/IDN 域名绕过
+  if (target.hostname.includes("xn--") || /[^\x00-\x7F]/.test(target.hostname)) {
+    throw problem(403, "International domain names not allowed");
+  }
+  // 防止路径穿越和 URL 编码绕过（包括大小写变体和混合编码）
+  const path = target.pathname.toLowerCase();
+  const pathOriginal = target.pathname;
+  if (path.includes("..") || 
+      path.includes("%2e") || 
+      path.includes("%252e") ||
+      pathOriginal.includes("..") ||
+      /\.\.|%2e|%252e/i.test(pathOriginal)) {
     throw problem(403, "Path traversal attempt detected");
   }
   // 禁止 URL 凭据和任意查询串；图片仅按 CDN 路径寻址。
@@ -271,6 +280,9 @@ function cors(response, request, env) {
   headers.set("Access-Control-Max-Age", "600");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("Referrer-Policy", "no-referrer");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  headers.set("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
   return new Response(response.body, { status: response.status, headers });
 }
 function problem(status, message) { return Object.assign(new Error(message), { status, publicMessage: message }); }
@@ -282,13 +294,15 @@ function upstreamProblem(status) {
 function secureCompare(a, b) {
   // 恒定时间字符串比较，防止时序攻击
   if (typeof a !== "string" || typeof b !== "string") return false;
-  if (a.length !== b.length) {
-    // 长度不同时仍进行完整比较以保持恒定时间
-    b = a;
-  }
-  let result = a.length ^ b.length;
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  // 使用固定长度比较，避免长度泄露
+  const aLen = a.length;
+  const bLen = b.length;
+  const maxLen = Math.max(aLen, bLen);
+  let result = aLen ^ bLen;
+  for (let i = 0; i < maxLen; i++) {
+    const aChar = i < aLen ? a.charCodeAt(i) : 0;
+    const bChar = i < bLen ? b.charCodeAt(i) : 0;
+    result |= aChar ^ bChar;
   }
   return result === 0;
 }
