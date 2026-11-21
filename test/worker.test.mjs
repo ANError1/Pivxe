@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 const call = (path, env = {}, init = {}) => worker.fetch(new Request(`https://mirror.example${path}`, init), env, {});
-const credentials = () => ({ PIXIV_REFRESH_TOKEN: "fake-refresh", PIXIV_CLIENT_ID: "fake-client", PIXIV_CLIENT_SECRET: "fake-secret" });
+const credentials = () => ({ PUBLIC_API: "true", PIXIV_REFRESH_TOKEN: "fake-refresh", PIXIV_CLIENT_ID: "fake-client", PIXIV_CLIENT_SECRET: "fake-secret" });
 
 async function mockFetch(fn, run) {
   const original = globalThis.fetch;
@@ -12,9 +12,9 @@ async function mockFetch(fn, run) {
 
 test("health, unknown route, missing word, missing credentials and method", async () => {
   assert.equal((await call("/healthz")).status, 200);
-  assert.equal((await call("/unknown")).status, 404);
-  assert.equal((await call("/api/search/illust")).status, 400);
-  assert.equal((await call("/api/search/illust?word=x&offset=-1")).status, 400);
+  assert.equal((await call("/unknown", { PUBLIC_API: "true" })).status, 404);
+  assert.equal((await call("/api/search/illust", { PUBLIC_API: "true" })).status, 400);
+  assert.equal((await call("/api/search/illust?word=x&offset=-1", { PUBLIC_API: "true" })).status, 400);
   assert.equal((await call("/api/illust/123")).status, 503);
   const res = await call("/api/illust/123", {}, { method: "POST" });
   assert.equal(res.status, 405);
@@ -33,9 +33,11 @@ test("CORS applies consistently to success, errors and preflight", async () => {
 });
 
 test("entry key and limiter are enforced before upstream calls", async () => {
+  assert.equal((await call("/api/illust/1", { PUBLIC_API: "false" })).status, 503);
+  assert.equal((await call("/api/search/illust", { PUBLIC_API: "true" })).status, 400);
   assert.equal((await call("/api/illust/1", { API_KEY: "key" })).status, 401);
   assert.equal((await call("/api/illust/1", { API_KEY: "key" }, { headers: { Authorization: "Bearer key" } })).status, 503);
-  const res = await call("/api/illust/1", { RATE_LIMITER: { limit: async () => ({ success: false }) } });
+  const res = await call("/api/illust/1", { PUBLIC_API: "true", RATE_LIMITER: { limit: async () => ({ success: false }) } });
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("Retry-After"), "60");
 });
@@ -133,9 +135,9 @@ test("401 refreshes once; concurrent requests share refresh", async () => {
 test("image allowlist blocks SSRF inputs without fetching", async () => {
   await mockFetch(() => { throw new Error("Must not fetch"); }, async () => {
     for (const target of ["https://evil.example/a", "https://i.pximg.net.evil.example/a", "http://i.pximg.net/a", "https://user:pass@i.pximg.net/a", "https://i.pximg.net:444/a", "https://127.0.0.1/a", "https://i.pximg.net./a"]) {
-      assert.equal((await call(`/api/proxy?url=${encodeURIComponent(target)}`)).status, 403);
+      assert.equal((await call(`/api/proxy?url=${encodeURIComponent(target)}`, { PUBLIC_API: "true" })).status, 403);
     }
-    assert.equal((await call("/api/proxy")).status, 400);
+    assert.equal((await call("/api/proxy", { PUBLIC_API: "true" })).status, 400);
   });
 });
 
@@ -147,14 +149,14 @@ test("image proxy rejects redirects, HTML and oversized content", async () => {
     [new Response("x", { headers: { "Content-Type": "image/jpeg", "Content-Length": "30000000" } }), 413],
   ]) {
     await mockFetch(async (_, init) => { assert.equal(init.redirect, "manual"); return response; }, async () => {
-      assert.equal((await call(path)).status, status);
+      assert.equal((await call(path, { PUBLIC_API: "true" })).status, status);
     });
   }
   await mockFetch(async (_, init) => {
     assert.equal(init.headers.authorization, undefined);
     return new Response(new Uint8Array([255, 216, 255]), { headers: { "Content-Type": "image/jpeg", "Set-Cookie": "secret=x" } });
   }, async () => {
-    const res = await call(path);
+    const res = await call(path, { PUBLIC_API: "true" });
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("Set-Cookie"), null);
     assert.equal((await res.arrayBuffer()).byteLength, 3);
@@ -172,4 +174,129 @@ test("upstream secrets never appear in public errors", async () => {
     assert.equal(res.status, 502);
     assert.ok(!(await res.text()).includes("super-sensitive"));
   });
+});
+
+
+test("upstream JSON bodies are bounded even without Content-Length", async () => {
+  let canceled = false;
+  const env = credentials();
+  await mockFetch(async (url) => {
+    if (new URL(url).hostname === "oauth.secure.pixiv.net") {
+      return Response.json({ access_token: "bounded-test-token", expires_in: 3600 });
+    }
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(8 * 1024 * 1024));
+        controller.enqueue(new Uint8Array([1]));
+      },
+      cancel() { canceled = true; },
+    });
+    return new Response(body);
+  }, async () => {
+    const response = await call("/api/illust/1", env);
+    assert.equal(response.status, 502);
+    assert.equal(canceled, true);
+  });
+});
+
+test("oversized OAuth JSON is rejected before calling the Pixiv API", async () => {
+  let apiCalls = 0;
+  await mockFetch(async (url) => {
+    if (new URL(url).hostname === "oauth.secure.pixiv.net") {
+      return new Response("{}", { headers: { "Content-Length": "65537" } });
+    }
+    apiCalls++;
+    return Response.json({ ok: true });
+  }, async () => {
+    const response = await call("/api/illust/1", credentials());
+    assert.equal(response.status, 502);
+    assert.equal(apiCalls, 0);
+  });
+});
+
+
+test("streaming JSON preserves split UTF-8, BOM, and invalid byte replacement", async () => {
+  const encoder = new TextEncoder();
+  const oauth = encoder.encode('\ufeff{"access_token":"token","expires_in":3600}');
+  const prefix = encoder.encode('\ufeff{"text":"初音🌌","invalid":"');
+  const suffix = encoder.encode('"}');
+  const api = new Uint8Array(prefix.length + 3 + suffix.length);
+  api.set(prefix);
+  api.set([0xe3, 0x28, 0xa1], prefix.length);
+  api.set(suffix, prefix.length + 3);
+
+  function splitResponse(bytes) {
+    let offset = 0;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (offset === bytes.length) controller.close();
+        else controller.enqueue(bytes.subarray(offset, ++offset));
+      },
+    }), { headers: { "Content-Length": "1" } });
+  }
+
+  await mockFetch(async (url, init) => {
+    if (new URL(url).hostname === "oauth.secure.pixiv.net") return splitResponse(oauth);
+    assert.equal(init.headers.authorization, "Bearer token");
+    return splitResponse(api);
+  }, async () => {
+    const response = await call("/api/illust/1", credentials());
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { text: "初音🌌", invalid: "�(�" });
+  });
+});
+
+test("image cache serves public hits and is skipped when caching is disabled", async () => {
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, "caches");
+  const entries = new Map();
+  let cacheAccesses = 0;
+  let fetches = 0;
+  const cache = {
+    async match(key) {
+      const entry = entries.get(key.url);
+      return entry && new Response(entry.body, { headers: entry.headers });
+    },
+    async put(key, response) {
+      entries.set(key.url, { body: await response.arrayBuffer(), headers: response.headers });
+    },
+  };
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: { get default() { cacheAccesses++; return cache; } },
+  });
+
+  async function requestImage(target, env, headers = {}) {
+    const pending = [];
+    const request = new Request(`https://mirror.example/api/proxy?url=${encodeURIComponent(target)}`, { headers });
+    const response = await worker.fetch(request, env, { waitUntil(promise) { pending.push(promise); } });
+    const body = await response.arrayBuffer();
+    await Promise.all(pending);
+    return { response, body: [...new Uint8Array(body)] };
+  }
+
+  try {
+    await mockFetch(async () => {
+      fetches++;
+      return new Response(new Uint8Array([1, 2, 3]), { headers: { "Content-Type": "image/png" } });
+    }, async () => {
+      const publicEnv = { PUBLIC_API: "true", CACHE_TTL: "60" };
+      const first = await requestImage("https://i.pximg.net/a.png?version=1", publicEnv);
+      const second = await requestImage("https://i.pximg.net/a.png?version=2", publicEnv);
+      assert.deepEqual(first.body, [1, 2, 3]);
+      assert.deepEqual(second.body, first.body);
+      assert.equal(second.response.headers.get("Cache-Control"), "public, max-age=60");
+      assert.equal(fetches, 1);
+      assert.equal(cacheAccesses, 2);
+
+      const privateImage = await requestImage("https://i.pximg.net/a.png", { API_KEY: "private", CACHE_TTL: "60" }, { Authorization: "Bearer private" });
+      assert.equal(privateImage.response.headers.get("Cache-Control"), "no-store");
+      const uncached = await requestImage("https://i.pximg.net/a.png", { PUBLIC_API: "true", CACHE_TTL: "0" });
+      assert.equal(uncached.response.headers.get("Cache-Control"), "no-store");
+      assert.equal(fetches, 3);
+      assert.equal(cacheAccesses, 2);
+    });
+  } finally {
+    if (originalCaches) Object.defineProperty(globalThis, "caches", originalCaches);
+    else delete globalThis.caches;
+  }
 });

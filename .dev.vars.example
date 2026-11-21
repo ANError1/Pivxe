@@ -4,6 +4,7 @@ PIXIV_CLIENT_ID=""
 PIXIV_CLIENT_SECRET=""
 # 可选：留空表示公开服务。不要在公开前端中内置此密钥。
 API_KEY=""
+PUBLIC_API="false"
 ALLOWED_ORIGINS="*"
 # 图片缓存 TTL（秒）；0 禁用。JSON 始终 no-store。
 CACHE_TTL="60"

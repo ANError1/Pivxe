@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 
-const env = { ALLOWED_ORIGINS: "*" };
+const env = { ALLOWED_ORIGINS: "*", PUBLIC_API: "true" };
 
 let response = await worker.fetch(new Request("https://example.com/healthz"), env, {});
 assert.equal(response.status, 200);

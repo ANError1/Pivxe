@@ -28,7 +28,7 @@ npm test
 npm run dev
 ```
 
-可在本地 `.dev.vars` 设置 `API_KEY`。若设置了该值，除 `/`、`/api` 和 `/healthz` 外的 API 均要求 `Authorization: Bearer <API_KEY>`。空值表示公开服务；CORS 不是访问控制。公开部署建议设置 API Key，或在 Cloudflare 前配置 Access / WAF / Rate Limiting。
+默认情况下，除 `/`、`/api` 和 `/healthz` 外的 API 都要求 `Authorization: Bearer <API_KEY>`；未配置 `API_KEY` 时请求会失败关闭。若明确要公开服务，设置 `PUBLIC_API="true"`。CORS 不是访问控制；公开部署应配置 Cloudflare WAF / Rate Limiting。
 
 ## Cloudflare 部署
 
@@ -44,7 +44,7 @@ npm run check
 npm run deploy
 ```
 
-所有 Secrets 都在提示时输入，不写入 `wrangler.toml`、代码或 Git。若想公开 API，可不配置 `API_KEY`，但应配置 Cloudflare WAF/限流并评估滥用与费用风险。上线前把 `ALLOWED_ORIGINS` 改成允许的前端源，并将 `CACHE_TTL` 设为需要的图片缓存时长（秒；设 `0` 关闭图片缓存）。JSON 始终不缓存。可以设置 `ENABLE_IMAGE_PROXY="false"` 关闭图片代理。
+所有 Secrets 都在提示时输入，不写入 `wrangler.toml`、代码或 Git。默认需配置 `API_KEY`；若想公开 API，显式设置 `PUBLIC_API="true"`，并配置 Cloudflare WAF/限流以控制滥用与费用风险。上线前把 `ALLOWED_ORIGINS` 改成允许的前端源，并将 `CACHE_TTL` 设为需要的图片缓存时长（秒；设 `0` 关闭图片缓存）。JSON 始终不缓存。可以设置 `ENABLE_IMAGE_PROXY="false"` 关闭图片代理。
 
 可选在 `wrangler.toml` 配置 Workers 原生 `[[ratelimits]]` 绑定，并绑定名称 `RATE_LIMITER`。示例已注释，部署前需配置本账号有效的 namespace id。该限流按 Cloudflare 提供的客户端 IP 应用，不能代替 API Key 或更广泛的滥用防护。
 
@@ -54,6 +54,7 @@ npm run deploy
 - Refresh token、client secret、API Key 在生产环境使用 Wrangler Secrets；勿写进客户端、URL、日志或 vars。
 - `API_KEY` 是镜像入口密钥，与 Pixiv OAuth token 不同。浏览器前端若把它打包进去，它就不再是秘密，应将 API 放在受控后端或使用 Cloudflare Access。
 - 图片代理目前固定返回 manual redirect 行为，拒绝任何上游跳转；只允许精确 CDN hostname，无客户端 Authorization/Cookie 转发，MIME 限制并限大小，且采用流式字节计数避免完整缓冲大图。配置 `API_KEY` 后图片响应为 `no-store`，防止下游共享缓存绕过入口鉴权。公开部署仍应加限流以控制带宽成本。
+- Pixiv API JSON 响应按流读取并限制为 8 MiB，OAuth JSON 限制为 64 KiB；即使上游缺少或伪造 `Content-Length`，也会在超限时取消读取。
 - 内存中的 OAuth access token 仅在 Worker isolate 内短期复用；并发刷新在单 isolate 内合并。不同 isolate 之间并无全局锁；若高并发下出现刷新风暴，需要 Durable Object 协调。
 - Pixiv API 是非官方且易变的上游。上游账号/地区策略、客户端版本、接口字段调整都可能导致请求失败。
 

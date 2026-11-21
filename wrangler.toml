@@ -6,6 +6,7 @@ compatibility_date = "2025-02-01"
 CACHE_TTL = "60"
 ALLOWED_ORIGINS = "*"
 ENABLE_IMAGE_PROXY = "true"
+PUBLIC_API = "false"
 
 # 可选：Cloudflare Workers 原生限流绑定；启用后按客户端 IP 限流。
 # namespace_id 请为本账号中此用途选择独立的正整数。

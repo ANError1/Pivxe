@@ -9,6 +9,31 @@ const APP_HEADERS = {
 };
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_API_JSON_BYTES = 8 * 1024 * 1024;
+const MAX_OAUTH_JSON_BYTES = 64 * 1024;
+const ID_ROUTES = [
+  [/^\/api\/illust\/([1-9]\d{0,19})$/, "illust", "/v1/illust/detail", "illust_id"],
+  [/^\/api\/illust\/([1-9]\d{0,19})\/comments$/, "comments", "/v1/illust/comments", "illust_id"],
+  [/^\/api\/illust\/([1-9]\d{0,19})\/related$/, "related", "/v2/illust/related", "illust_id"],
+  [/^\/api\/ugoira\/([1-9]\d{0,19})$/, "ugoira", "/v1/ugoira/metadata", "illust_id"],
+  [/^\/api\/user\/([1-9]\d{0,19})$/, "user", "/v1/user/detail", "user_id"],
+  [/^\/api\/user\/([1-9]\d{0,19})\/illusts$/, "userIllusts", "/v1/user/illusts", "user_id"],
+];
+const STATIC_ROUTES = {
+  "/api/search/illust": ["search", "/v1/search/illust"],
+  "/api/search/user": ["searchUser", "/v1/search/user"],
+  "/api/recommended": ["recommended", "/v1/illust/recommended"],
+  "/api/ranking": ["ranking", "/v1/illust/ranking"],
+};
+const ALLOWED_QUERY_PARAMETERS = {
+  illust: ["filter"], comments: ["offset", "include_total_comments"],
+  related: ["offset", "filter", "seed_illust_ids[]"], ugoira: [], user: ["filter"],
+  userIllusts: ["type", "offset", "filter"],
+  search: ["word", "search_target", "sort", "duration", "filter", "offset", "start_date", "end_date"],
+  searchUser: ["word", "offset", "filter"],
+  recommended: ["filter", "offset", "include_ranking_label", "min_bookmark_id_for_recent_illust", "max_bookmark_id_for_recommend"],
+  ranking: ["mode", "date", "offset", "filter"],
+};
 // 每个 isolate / 每套凭据独立缓存；不把凭据放进 HTTP 缓存。
 const tokens = new WeakMap();
 
@@ -38,8 +63,12 @@ async function handle(request, env, ctx) {
       endpoints: ["/api/illust/:id", "/api/illust/:id/comments", "/api/illust/:id/related", "/api/ugoira/:id", "/api/user/:id", "/api/user/:id/illusts", "/api/search/illust?word=...", "/api/search/user?word=...", "/api/ranking", "/api/recommended", "/api/proxy?url=..."],
     });
   }
-  // CORS 不是身份认证；为共享的 Pixiv 账号配置独立入口密钥。
-  if (env.API_KEY && !secureCompare(request.headers.get("Authorization"), `Bearer ${env.API_KEY}`)) {
+  // Shared Pixiv credentials must not become public because API_KEY was omitted.
+  const hasApiKey = typeof env.API_KEY === "string" && env.API_KEY.length > 0;
+  if (!hasApiKey && env.PUBLIC_API !== "true") {
+    throw problem(503, "API key is not configured");
+  }
+  if (hasApiKey && !secureCompare(request.headers.get("Authorization"), `Bearer ${env.API_KEY}`)) {
     throw problem(401, "Unauthorized");
   }
   if (env.RATE_LIMITER) {
@@ -68,7 +97,7 @@ async function handle(request, env, ctx) {
     await result.body?.cancel();
     throw upstreamProblem(result.status);
   }
-  const data = await result.json();
+  const data = await readJsonLimited(result, MAX_API_JSON_BYTES, "Pixiv API response is invalid or too large");
   // 分页链接改为本镜像，绝不提供任意 app-api 转发入口。
   if (data.next_url) data.next_url = mirrorNextUrl(data.next_url, route, url);
   // 带账号上下文的 JSON 不写共享缓存（包括推荐和收藏状态）。
@@ -76,38 +105,17 @@ async function handle(request, env, ctx) {
 }
 
 function matchRoute(path) {
-  const patterns = [
-    [/^\/api\/illust\/([1-9]\d{0,19})$/, "illust", "/v1/illust/detail", "illust_id"],
-    [/^\/api\/illust\/([1-9]\d{0,19})\/comments$/, "comments", "/v1/illust/comments", "illust_id"],
-    [/^\/api\/illust\/([1-9]\d{0,19})\/related$/, "related", "/v2/illust/related", "illust_id"],
-    [/^\/api\/ugoira\/([1-9]\d{0,19})$/, "ugoira", "/v1/ugoira/metadata", "illust_id"],
-    [/^\/api\/user\/([1-9]\d{0,19})$/, "user", "/v1/user/detail", "user_id"],
-    [/^\/api\/user\/([1-9]\d{0,19})\/illusts$/, "userIllusts", "/v1/user/illusts", "user_id"],
-  ];
-  for (const [pattern, name, upstream, idKey] of patterns) {
+  const entry = STATIC_ROUTES[path];
+  if (entry) return { name: entry[0], path: entry[1] };
+  for (const [pattern, name, upstream, idKey] of ID_ROUTES) {
     const match = path.match(pattern);
     if (match) return { name, path: upstream, fixed: { [idKey]: match[1] } };
   }
-  const routes = {
-    "/api/search/illust": ["search", "/v1/search/illust"],
-    "/api/search/user": ["searchUser", "/v1/search/user"],
-    "/api/recommended": ["recommended", "/v1/illust/recommended"],
-    "/api/ranking": ["ranking", "/v1/illust/ranking"],
-  };
-  const entry = routes[path];
-  return entry ? { name: entry[0], path: entry[1] } : null;
+  return null;
 }
 
 function queryFor(name, input) {
-  const allowed = {
-    illust: ["filter"], comments: ["offset", "include_total_comments"],
-    related: ["offset", "filter", "seed_illust_ids[]"], ugoira: [], user: ["filter"],
-    userIllusts: ["type", "offset", "filter"],
-    search: ["word", "search_target", "sort", "duration", "filter", "offset", "start_date", "end_date"],
-    searchUser: ["word", "offset", "filter"],
-    recommended: ["filter", "offset", "include_ranking_label", "min_bookmark_id_for_recent_illust", "max_bookmark_id_for_recommend"],
-    ranking: ["mode", "date", "offset", "filter"],
-  }[name];
+  const allowed = ALLOWED_QUERY_PARAMETERS[name];
   const output = new URLSearchParams();
   for (const key of allowed) {
     for (const value of input.getAll(key)) {
@@ -169,9 +177,44 @@ async function refreshToken(env) {
     await response.body?.cancel();
     throw problem(502, "Pixiv OAuth refresh failed");
   }
-  const data = await response.json();
+  const data = await readJsonLimited(response, MAX_OAUTH_JSON_BYTES, "Invalid Pixiv OAuth response");
   if (typeof data.access_token !== "string" || !data.access_token) throw problem(502, "Invalid Pixiv OAuth response");
   return data;
+}
+
+async function readJsonLimited(response, maxBytes, errorMessage) {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw problem(502, errorMessage);
+  }
+  if (!response.body) throw problem(502, errorMessage);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw problem(502, errorMessage);
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    if (err?.status) throw err;
+    throw problem(502, errorMessage);
+  }
+
+  try {
+    chunks.push(decoder.decode());
+    return JSON.parse(chunks.join(""));
+  } catch {
+    throw problem(502, errorMessage);
+  }
+
 }
 
 async function proxyImage(url, env, ctx) {
@@ -202,9 +245,9 @@ async function proxyImage(url, env, ctx) {
   // 带 API Key 的入口是私有服务：禁用共享图片缓存，避免缓存命中绕过入口鉴权。
   const configuredTtl = Math.max(0, Math.min(86400, Number(env.CACHE_TTL) || 0));
   const ttl = env.API_KEY ? 0 : configuredTtl;
-  const cache = typeof caches !== "undefined" ? caches.default : null;
-  const key = new Request(new URL(`/__image_cache_v1/${encodeURIComponent(target.href)}`, url.origin));
-  if (cache && ttl > 0) {
+  const cache = ttl > 0 && typeof caches !== "undefined" ? caches.default : null;
+  const key = cache ? new Request(new URL(`/__image_cache_v1/${encodeURIComponent(target.href)}`, url.origin)) : null;
+  if (cache) {
     const hit = await cache.match(key);
     if (hit) return hit;
   }
@@ -252,7 +295,7 @@ async function proxyImage(url, env, ctx) {
       "Cache-Control": ttl > 0 ? `public, max-age=${ttl}` : "no-store",
     },
   });
-  if (cache && ttl > 0 && ctx?.waitUntil) ctx.waitUntil(cache.put(key, image.clone()).catch(() => {}));
+  if (cache && ctx?.waitUntil) ctx.waitUntil(cache.put(key, image.clone()).catch(() => {}));
   return image;
 }
 
